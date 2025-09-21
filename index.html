@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>HTML Inliner + Dependency Visualizer</title>
+<style>
+body { margin: 0; font-family: Arial, sans-serif; display: flex; height: 100vh; }
+#sidebar { width: 300px; background: #f4f4f4; padding: 20px; box-sizing: border-box; border-right: 1px solid #ccc; display: flex; flex-direction: column; gap: 10px; }
+#sidebar h2 { margin-top: 0; }
+#svgContainer { flex: 1; position: relative; }
+svg { width: 100%; height: 100%; }
+button { padding: 10px; cursor: pointer; border: none; background: #1f77b4; color: white; font-size: 14px; border-radius: 4px; }
+button:hover { background: #155d8b; }
+button:disabled { background: #ccc; cursor: not-allowed; }
+#log { margin-top: 10px; font-size: 12px; color: #555; overflow-y: auto; max-height: 200px; border: 1px solid #ddd; padding: 5px; background: white; }
+.node circle { stroke: #fff; stroke-width: 1.5px; }
+.node text { font-size: 12px; pointer-events: none; }
+.link { stroke: #999; stroke-opacity: 0.6; stroke-width: 2px; }
+.error { color: #d62728; }
+.success { color: #2ca02c; }
+.warning { color: #ff7f0e; }
+</style>
+</head>
+<body>
+
+<div id="sidebar">
+    <h2>HTMLInliner</h2>
+    <input type="file" id="files" multiple>
+    <button id="downloadBtn" disabled>Download Inlined HTML</button>
+    <div id="log"></div>
+</div>
+
+<div id="svgContainer">
+    <svg id="svg"></svg>
+</div>
+
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<script>
+let files = {};
+let htmlFileName = '';
+let doc;
+
+function log(message, type = 'info') {
+    const logDiv = document.getElementById('log');
+    const className = type === 'error' ? 'error' : type === 'success' ? 'success' : type === 'warning' ? 'warning' : '';
+    logDiv.innerHTML += `<div class="${className}">${message}</div>`;
+    logDiv.scrollTop = logDiv.scrollHeight;
+}
+
+function normalizePath(path) {
+    return path.replace(/^(\.\/|\/)/, '').replace(/\\/g, '/'); // normalize
+}
+
+async function fileToBase64(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+    });
+}
+
+async function fetchWithTimeout(url, timeout = 10000) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+    
+    try {
+        const res = await fetch(url, { signal: controller.signal });
+        clearTimeout(timeoutId);
+        if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+        return await res.text();
+    } catch (e) {
+        clearTimeout(timeoutId);
+        if (e.name === 'AbortError') {
+            throw new Error('Request timeout');
+        }
+        throw e;
+    }
+}
+
+function extractCssUrls(cssText, baseUrl = '') {
+    const urls = [];
+    const urlPattern = /url\s*\(\s*['"]?([^'")]+)['"]?\s*\)/gi;
+    let match;
+    
+    while ((match = urlPattern.exec(cssText)) !== null) {
+        let url = match[1];
+        if (!url.startsWith('data:') && !url.startsWith('http')) {
+            urls.push(url);
+        }
+    }
+    return urls;
+}
+
+function extractCssImports(cssText) {
+    const imports = [];
+    const importPattern = /@import\s+(?:url\s*\(\s*)?['"]?([^'");\s]+)['"]?\s*(?:\)\s*)?(?:[^;]*)?;/gi;
+    let match;
+    
+    while ((match = importPattern.exec(cssText)) !== null) {
+        let url = match[1];
+        if (!url.startsWith('data:') && !url.startsWith('http')) {
+            imports.push(url);
+        }
+    }
+    return imports;
+}
+
+function extractJsImports(jsText) {
+    const imports = [];
+    
+    // ES6 imports: import ... from 'module'
+    const es6ImportPattern = /import\s+(?:[^'"]*\s+from\s+)?['"]([^'"]+)['"]/gi;
+    let match;
+    while ((match = es6ImportPattern.exec(jsText)) !== null) {
+        const url = match[1];
+        if (!url.startsWith('http') && !url.startsWith('.') && url.includes('/')) {
+            imports.push(url);
+        } else if (url.startsWith('./') || url.startsWith('../')) {
+            imports.push(url);
+        }
+    }
+    
+    // CommonJS requires: require('module')
+    const requirePattern = /require\s*\(\s*['"]([^'"]+)['"]\s*\)/gi;
+    while ((match = requirePattern.exec(jsText)) !== null) {
+        const url = match[1];
+        if (!url.startsWith('http') && !url.startsWith('.') && url.includes('/')) {
+            imports.push(url);
+        } else if (url.startsWith('./') || url.startsWith('../')) {
+            imports.push(url);
+        }
+    }
+    
+    // Dynamic imports: import('module')
+    const dynamicImportPattern = /import\s*\(\s*['"]([^'"]+)['"]\s*\)/gi;
+    while ((match = dynamicImportPattern.exec(jsText)) !== null) {
+        const url = match[1];
+        if (!url.startsWith('http') && !url.startsWith('.') && url.includes('/')) {
+            imports.push(url);
+        } else if (url.startsWith('./') || url.startsWith('../')) {
+            imports.push(url);
+        }
+    }
+    
+    return [...new Set(imports)]; // Remove duplicates
+}
+
+async function inlineCssUrls(cssText, baseFiles) {
+    let inlinedCss = cssText;
+    const urls = extractCssUrls(cssText);
+    
+    for (const url of urls) {
+        const normalizedUrl = normalizePath(url);
+        const file = baseFiles[normalizedUrl];
+        
+        if (file) {
+            try {
+                const base64 = await fileToBase64(file);
+                inlinedCss = inlinedCss.replace(
+                    new RegExp(`url\\s*\\(\\s*['"]?${url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}['"]?\\s*\\)`, 'gi'),
+                    `url("${base64}")`
+                );
+                log(`✓ Inlined CSS asset: ${url}`, 'success');
+            } catch (e) {
+                log(`✗ Failed to inline CSS asset: ${url} - ${e.message}`, 'error');
+            }
+        }
+    }
+    
+    return inlinedCss;
+}
+
+async function inlineCssImports(cssText, baseFiles, processedFiles = new Set()) {
+    let inlinedCss = cssText;
+    const imports = extractCssImports(cssText);
+    
+    for (const importUrl of imports) {
+        const normalizedUrl = normalizePath(importUrl);
+        
+        if (processedFiles.has(normalizedUrl)) {
+            log(`⚠ Circular CSS import detected: ${importUrl}`, 'warning');
+            continue;
+        }
+        
+        const file = baseFiles[normalizedUrl];
+        if (file) {
+            try {
+                processedFiles.add(normalizedUrl);
+                const importedCss = await file.text();
+                
+                // Recursively process imports in the imported CSS
+                const processedImportedCss = await inlineCssImports(importedCss, baseFiles, new Set(processedFiles));
+                const finalCss = await inlineCssUrls(processedImportedCss, baseFiles);
+                
+                // Replace the @import statement with the actual CSS content
+                const importRegex = new RegExp(`@import\\s+(?:url\\s*\\(\\s*)?['"]?${importUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}['"]?\\s*(?:\\)\\s*)?(?:[^;]*)?;`, 'gi');
+                inlinedCss = inlinedCss.replace(importRegex, `/* Imported from ${importUrl} */\n${finalCss}\n`);
+                
+                log(`✓ Inlined CSS import: ${importUrl}`, 'success');
+            } catch (e) {
+                log(`✗ Failed to inline CSS import: ${importUrl} - ${e.message}`, 'error');
+            }
+        } else {
+            log(`✗ Missing CSS import: ${importUrl}`, 'error');
+        }
+    }
+    
+    return inlinedCss;
+}
+
+async function generateGraph() {
+    if (!doc) return;
+
+    const nodes = [{id: htmlFileName, type: 'html', status: 'present'}];
+    const links = [];
+    const processedDependencies = new Set();
+
+    async function addDependenciesRecursively(parentId, parentType) {
+        if (processedDependencies.has(parentId)) return;
+        processedDependencies.add(parentId);
+
+        if (parentType === 'html') {
+            // CSS links
+            Array.from(doc.querySelectorAll('link[rel="stylesheet"]')).forEach(link => {
+                const href = link.getAttribute('href');
+                const norm = normalizePath(href);
+                const status = href.startsWith('http') ? 'external' : (files[norm] ? 'present' : 'missing');
+                const existingNode = nodes.find(n => n.id === href);
+                if (!existingNode) {
+                    nodes.push({id: href, type: 'css', status});
+                }
+                links.push({source: parentId, target: href});
+            });
+
+            // JS scripts
+            Array.from(doc.querySelectorAll('script[src]')).forEach(script => {
+                const src = script.getAttribute('src');
+                const norm = normalizePath(src);
+                const status = src.startsWith('http') ? 'external' : (files[norm] ? 'present' : 'missing');
+                const existingNode = nodes.find(n => n.id === src);
+                if (!existingNode) {
+                    nodes.push({id: src, type: 'js', status});
+                }
+                links.push({source: parentId, target: src});
+            });
+
+            // Images
+            Array.from(doc.querySelectorAll('img[src]')).forEach(img => {
+                const src = img.getAttribute('src');
+                const norm = normalizePath(src);
+                const status = src.startsWith('http') || src.startsWith('data:') ? 'external' : (files[norm] ? 'present' : 'missing');
+                const existingNode = nodes.find(n => n.id === src);
+                if (!existingNode) {
+                    nodes.push({id: src, type: 'img', status});
+                }
+                links.push({source: parentId, target: src});
+            });
+
+            // Audio/video
+            Array.from(doc.querySelectorAll('audio[src], video[src], source[src]')).forEach(media => {
+                const src = media.getAttribute('src');
+                const norm = normalizePath(src);
+                const status = src.startsWith('http') || src.startsWith('data:') ? 'external' : (files[norm] ? 'present' : 'missing');
+                const existingNode = nodes.find(n => n.id === src);
+                if (!existingNode) {
+                    nodes.push({id: src, type: 'media', status});
+                }
+                links.push({source: parentId, target: src});
+            });
+        }
+
+        // Handle CSS file dependencies
+        if (parentType === 'css' || (parentType === 'html' && parentId.endsWith('.css'))) {
+            const cssFileName = parentType === 'css' ? parentId : null;
+            const cssFile = cssFileName ? files[normalizePath(cssFileName)] : 
+                          Array.from(doc.querySelectorAll('link[rel="stylesheet"]'))
+                            .find(link => link.getAttribute('href') === parentId);
+            
+            if (cssFile || (cssFile === null && files[normalizePath(parentId)])) {
+                try {
+                    const cssContent = cssFile ? await cssFile.text() : await files[normalizePath(parentId)].text();
+                    
+                    // CSS @imports
+                    const imports = extractCssImports(cssContent);
+                    for (const importUrl of imports) {
+                        const norm = normalizePath(importUrl);
+                        const status = importUrl.startsWith('http') ? 'external' : (files[norm] ? 'present' : 'missing');
+                        const existingNode = nodes.find(n => n.id === importUrl);
+                        if (!existingNode) {
+                            nodes.push({id: importUrl, type: 'css', status});
+                        }
+                        links.push({source: parentId, target: importUrl});
+                        
+                        // Recursively process imported CSS
+                        await addDependenciesRecursively(importUrl, 'css');
+                    }
+                    
+                    // CSS url() assets
+                    const urls = extractCssUrls(cssContent);
+                    for (const url of urls) {
+                        const norm = normalizePath(url);
+                        const status = url.startsWith('http') || url.startsWith('data:') ? 'external' : (files[norm] ? 'present' : 'missing');
+                        const existingNode = nodes.find(n => n.id === url);
+                        if (!existingNode) {
+                            nodes.push({id: url, type: 'asset', status});
+                        }
+                        links.push({source: parentId, target: url});
+                    }
+                } catch (e) {
+                    log(`Warning: Could not parse CSS file ${parentId}`, 'warning');
+                }
+            }
+        }
+
+        // Handle JS file dependencies
+        if (parentType === 'js' || (parentType === 'html' && parentId.endsWith('.js'))) {
+            const jsFileName = parentType === 'js' ? parentId : null;
+            const jsFile = jsFileName ? files[normalizePath(jsFileName)] : 
+                         Array.from(doc.querySelectorAll('script[src]'))
+                           .find(script => script.getAttribute('src') === parentId);
+            
+            if (jsFile || (jsFile === null && files[normalizePath(parentId)])) {
+                try {
+                    const jsContent = jsFile ? await jsFile.text() : await files[normalizePath(parentId)].text();
+                    
+                    // JS imports/requires
+                    const imports = extractJsImports(jsContent);
+                    for (const importUrl of imports) {
+                        let resolvedUrl = importUrl;
+                        
+                        // Resolve relative paths
+                        if (importUrl.startsWith('./') || importUrl.startsWith('../')) {
+                            // Simple resolution - in a real bundler this would be more complex
+                            resolvedUrl = normalizePath(importUrl);
+                        }
+                        
+                        // Try common JS extensions
+                        const possibleFiles = [
+                            resolvedUrl,
+                            resolvedUrl + '.js',
+                            resolvedUrl + '/index.js'
+                        ];
+                        
+                        let found = false;
+                        for (const possibleFile of possibleFiles) {
+                            const norm = normalizePath(possibleFile);
+                            if (files[norm]) {
+                                const existingNode = nodes.find(n => n.id === possibleFile);
+                                if (!existingNode) {
+                                    nodes.push({id: possibleFile, type: 'js', status: 'present'});
+                                }
+                                links.push({source: parentId, target: possibleFile});
+                                
+                                // Recursively process imported JS
+                                await addDependenciesRecursively(possibleFile, 'js');
+                                found = true;
+                                break;
+                            }
+                        }
+                        
+                        if (!found) {
+                            // Mark as missing/external
+                            const status = importUrl.startsWith('http') || !importUrl.includes('/') ? 'external' : 'missing';
+                            const existingNode = nodes.find(n => n.id === importUrl);
+                            if (!existingNode) {
+                                nodes.push({id: importUrl, type: 'js', status});
+                            }
+                            links.push({source: parentId, target: importUrl});
+                        }
+                    }
+                } catch (e) {
+                    log(`Warning: Could not parse JS file ${parentId}`, 'warning');
+                }
+            }
+        }
+    }
+
+    // Start recursive dependency analysis
+    await addDependenciesRecursively(htmlFileName, 'html');
+
+    // Also process standalone CSS and JS files that might not be linked from HTML
+    for (const fileName of Object.keys(files)) {
+        if (fileName.endsWith('.css') && !nodes.find(n => n.id === fileName)) {
+            nodes.push({id: fileName, type: 'css', status: 'present'});
+            await addDependenciesRecursively(fileName, 'css');
+        }
+        if (fileName.endsWith('.js') && !nodes.find(n => n.id === fileName)) {
+            nodes.push({id: fileName, type: 'js', status: 'present'});
+            await addDependenciesRecursively(fileName, 'js');
+        }
+    }
+
+    const svg = d3.select('#svg');
+    svg.selectAll('*').remove();
+    const width = svg.node().clientWidth;
+    const height = svg.node().clientHeight;
+
+    const simulation = d3.forceSimulation(nodes)
+        .force('link', d3.forceLink(links).id(d => d.id).distance(120))
+        .force('charge', d3.forceManyBody().strength(-400))
+        .force('center', d3.forceCenter(width/2, height/2));
+
+    const link = svg.append('g').selectAll('line').data(links).enter().append('line').attr('class','link');
+
+    const node = svg.append('g').selectAll('g').data(nodes).enter().append('g').attr('class','node');
+
+    node.append('circle')
+        .attr('r', d => d.type === 'html' ? 20 : 15)
+        .attr('fill', d => {
+            if(d.status === 'missing') return '#d62728';
+            if(d.status === 'external') return '#9467bd';
+            if(d.type === 'html') return '#1f77b4';
+            if(d.type === 'css') return '#2ca02c';
+            if(d.type === 'js') return '#ff7f0e';
+            if(d.type === 'img') return '#17becf';
+            if(d.type === 'media') return '#bcbd22';
+            if(d.type === 'asset') return '#e377c2';
+            return '#ccc';
+        })
+        .attr('stroke', d => d.status === 'missing' ? '#a00' : '#fff')
+        .attr('stroke-width', d => d.status === 'missing' ? 3 : 1.5);
+
+    node.append('text')
+        .attr('dx', 18)
+        .attr('dy', 5)
+        .text(d => {
+            const name = d.id.split('/').pop();
+            return name.length > 15 ? name.substring(0, 12) + '...' : name;
+        })
+        .attr('fill', d => d.status === 'missing' ? '#d62728' : '#000');
+
+    // Add tooltips
+    node.append('title').text(d => `${d.id} (${d.type}, ${d.status})`);
+
+    simulation.on('tick', ()=>{
+        link.attr('x1', d=>d.source.x).attr('y1', d=>d.source.y)
+            .attr('x2', d=>d.target.x).attr('y2', d=>d.target.y);
+        node.attr('transform', d=>`translate(${d.x},${d.y})`);
+    });
+
+    node.call(d3.drag()
+        .on('start', dragstarted)
+        .on('drag', dragged)
+        .on('end', dragended));
+
+    function dragstarted(event,d){ if(!event.active) simulation.alphaTarget(0.3).restart(); d.fx=d.x; d.fy=d.y; }
+    function dragged(event,d){ d.fx=event.x; d.fy=event.y; }
+    function dragended(event,d){ if(!event.active) simulation.alphaTarget(0); d.fx=null; d.fy=null; }
+
+    // Stats
+    const stats = nodes.reduce((acc, n) => {
+        acc[n.status] = (acc[n.status] || 0) + 1;
+        return acc;
+    }, {});
+    
+    log(`Dependencies: ${stats.present || 0} present, ${stats.missing || 0} missing, ${stats.external || 0} external`);
+}
+
+// Handle file selection
+document.getElementById('files').addEventListener('change', async (e)=>{
+    files = {};
+    document.getElementById('log').innerHTML = '';
+    document.getElementById('downloadBtn').disabled = true;
+    
+    for(let f of e.target.files){
+        files[normalizePath(f.name)] = f;
+    }
+
+    const htmlFiles = Object.keys(files).filter(name=>name.endsWith('.html'));
+    if(htmlFiles.length === 0){ 
+        log('No HTML file selected!', 'error'); 
+        return; 
+    }
+    
+    if(htmlFiles.length > 1){
+        log(`Multiple HTML files found: ${htmlFiles.join(', ')}. Using: ${htmlFiles[0]}`, 'warning');
+    }
+    
+    htmlFileName = htmlFiles[0];
+
+    try {
+        const htmlText = await files[htmlFileName].text();
+        doc = new DOMParser().parseFromString(htmlText, 'text/html');
+        
+        // Check for parse errors
+        const parserError = doc.querySelector('parsererror');
+        if (parserError) {
+            log('HTML parsing warning: Document may have syntax errors', 'warning');
+        }
+        
+        log(`Loaded HTML: ${htmlFileName}`, 'success');
+        document.getElementById('downloadBtn').disabled = false;
+
+        await generateGraph();
+        log('Dependency graph generated', 'success');
+    } catch (error) {
+        log(`Error loading HTML: ${error.message}`, 'error');
+    }
+});
+
+// Download inlined HTML
+document.getElementById('downloadBtn').addEventListener('click', async ()=>{
+    if(!doc){ 
+        log('Load HTML first', 'error'); 
+        return; 
+    }
+    
+    document.getElementById('downloadBtn').disabled = true;
+    log('Starting inlining process...', 'info');
+
+    try {
+        const docClone = doc.cloneNode(true);
+
+        // Inline CSS
+        const cssLinks = Array.from(docClone.querySelectorAll('link[rel="stylesheet"]'));
+        for(let link of cssLinks){
+            const href = link.getAttribute('href');
+            let cssText = '';
+            
+            if(href.startsWith('http')) {
+                try {
+                    cssText = await fetchWithTimeout(href);
+                    log(`✓ Fetched external CSS: ${href}`, 'success');
+                } catch (e) {
+                    log(`✗ Failed to fetch CSS: ${href} - ${e.message}`, 'error');
+                    continue;
+                }
+            } else {
+                const f = files[normalizePath(href)];
+                if(f) {
+                    cssText = await f.text();
+                    log(`✓ Loaded local CSS: ${href}`, 'success');
+                } else {
+                    log(`✗ Missing CSS file: ${href}`, 'error');
+                    continue;
+                }
+            }
+            
+            if(cssText){
+                // Process CSS imports first
+                const cssWithInlinedImports = await inlineCssImports(cssText, files);
+                
+                // Then inline CSS assets (fonts, images in CSS)
+                const fullyInlinedCss = await inlineCssUrls(cssWithInlinedImports, files);
+                
+                const style = docClone.createElement('style');
+                style.textContent = fullyInlinedCss;
+                
+                // Preserve media queries and other attributes
+                const media = link.getAttribute('media');
+                if(media) style.setAttribute('media', media);
+                
+                link.replaceWith(style);
+            }
+        }
+
+        // Inline JS
+        const scripts = Array.from(docClone.querySelectorAll('script[src]'));
+        for(let script of scripts){
+            const src = script.getAttribute('src');
+            let jsText = '';
+            
+            if(src.startsWith('http')) {
+                try {
+                    jsText = await fetchWithTimeout(src);
+                    log(`✓ Fetched external JS: ${src}`, 'success');
+                } catch (e) {
+                    log(`✗ Failed to fetch JS: ${src} - ${e.message}`, 'error');
+                    continue;
+                }
+            } else {
+                const f = files[normalizePath(src)];
+                if(f) {
+                    jsText = await f.text();
+                    log(`✓ Loaded local JS: ${src}`, 'success');
+                } else {
+                    log(`✗ Missing JS file: ${src}`, 'error');
+                    continue;
+                }
+            }
+            
+            if(jsText){
+                const newScript = docClone.createElement('script');
+                newScript.textContent = jsText;
+                
+                // Preserve all attributes except src
+                for(let attr of script.attributes) {
+                    if(attr.name !== 'src') {
+                        newScript.setAttribute(attr.name, attr.value);
+                    }
+                }
+                script.replaceWith(newScript);
+            }
+        }
+
+        // Inline media
+        const mediaTags = [...docClone.querySelectorAll('img[src], audio[src], video[src], source[src]')];
+        for(let tag of mediaTags){
+            const src = tag.getAttribute('src');
+            
+            if(src.startsWith('data:') || src.startsWith('http')) {
+                continue; // Skip data URLs and external URLs
+            }
+            
+            const f = files[normalizePath(src)];
+            if(f) {
+                try {
+                    const base64 = await fileToBase64(f);
+                    tag.setAttribute('src', base64);
+                    log(`✓ Inlined media: ${src}`, 'success');
+                } catch (e) {
+                    log(`✗ Failed to inline media: ${src} - ${e.message}`, 'error');
+                }
+            } else {
+                log(`✗ Missing media file: ${src}`, 'error');
+            }
+        }
+
+        const inlinedHTML = '<!DOCTYPE html>\n' + docClone.documentElement.outerHTML;
+        const blob = new Blob([inlinedHTML], {type:'text/html'});
+        const a = document.createElement('a'); 
+        a.href = URL.createObjectURL(blob);
+        a.download = htmlFileName.replace(/\.html$/, '') + '.inlined.html'; 
+        a.click();
+        
+        log('✓ Inlined HTML downloaded successfully!', 'success');
+    } catch (error) {
+        log(`✗ Error during inlining: ${error.message}`, 'error');
+    } finally {
+        document.getElementById('downloadBtn').disabled = false;
+    }
+});
+
+// Handle window resize for graph
+window.addEventListener('resize', () => {
+    if (doc) {
+        setTimeout(generateGraph, 100);
+    }
+});
+</script>
+</body>
+</html>
