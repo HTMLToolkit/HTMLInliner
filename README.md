@@ -1,5 +1,8 @@
 # HTMLInliner
 
+> # Archived: 10/13/2026
+> This will be folded into HTMLVisualizer lol
+
 Standalone utility for:
 - loading the full contents of a static web project
 - visualising every dependency (HTML → CSS → JS → assets)
